@@ -1,0 +1,40 @@
+# Large data files
+data/
+*.fastq
+*.fastq.gz
+*.sra
+*.sra.tmp
+*.sra.prf
+*.h5
+*.tar
+*.zip
+*.pkl
+*.pkl.gz
+
+# Results (large CSV/TSV)
+results/
+results/*/
+
+# Logs
+logs/
+*.log
+
+# Figures (PDF/PNG)
+figures/
+*.pdf
+*.png
+
+# Models (large pickle files)
+models/
+
+# R temp files
+Rplots.pdf
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Kimi
+.kimi-code/
+*.pdf
