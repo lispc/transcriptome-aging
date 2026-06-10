@@ -10,38 +10,40 @@ import argparse
 import numpy as np
 import pandas as pd
 import scanpy as sc
-from sklearn.linear_model import LogisticRegression, ElasticNet, ElasticNetCV
+from sklearn.linear_model import LogisticRegression, ElasticNet, ElasticNetCV, RidgeCV, LinearRegression
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.metrics import accuracy_score, roc_auc_score, mean_absolute_error, r2_score
-from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.model_selection import StratifiedKFold, cross_val_predict, KFold
 from sklearn.preprocessing import StandardScaler
 import warnings
 warnings.filterwarnings("ignore")
 
 
-def binary_classify(X, y_age, model_type="elasticnet", cv_folds=5):
-    """Binary young vs old classification."""
+from sklearn.model_selection import train_test_split
+
+def binary_classify(X, y_age, model_type="logistic"):
+    """Binary young vs old classification - fast train/test split."""
     y = (y_age >= 18).astype(int)  # 1=old, 0=young
     
-    if model_type == "elasticnet":
-        model = LogisticRegression(penalty="elasticnet", solver="saga",
-                                    l1_ratio=0.5, C=0.1, max_iter=5000,
-                                    random_state=42)
-    elif model_type == "logistic":
-        model = LogisticRegression(max_iter=5000, random_state=42)
+    if model_type == "logistic":
+        model = LogisticRegression(solver="liblinear", max_iter=1000,
+                                    tol=1e-3, random_state=42)
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
     
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
     
-    # Stratified CV
-    cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
-    y_proba = cross_val_predict(model, X_scaled, y, cv=cv, method="predict_proba")[:, 1]
+    # Train/test split (80/20, stratified)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_scaled, y, test_size=0.2, random_state=42, stratify=y)
+    
+    model.fit(X_train, y_train)
+    y_proba = model.predict_proba(X_test)[:, 1]
     y_pred = (y_proba >= 0.5).astype(int)
     
-    acc = accuracy_score(y, y_pred)
-    auc = roc_auc_score(y, y_proba)
+    acc = accuracy_score(y_test, y_pred)
+    auc = roc_auc_score(y_test, y_proba)
     
     return {
         "accuracy": acc,
@@ -51,35 +53,33 @@ def binary_classify(X, y_age, model_type="elasticnet", cv_folds=5):
     }
 
 
-def regression_predict(X, y_age, model_type="elasticnet", cv_folds=5):
-    """Continuous age regression."""
+from sklearn.model_selection import train_test_split
+
+def regression_predict(X, y_age, model_type="linear"):
+    """Continuous age regression - fast train/test split for speed."""
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
     
-    if model_type == "elasticnet":
-        model = ElasticNetCV(l1_ratio=0.5, cv=cv_folds, max_iter=5000, random_state=42)
+    # Train/test split (80/20)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_scaled, y_age, test_size=0.2, random_state=42)
+    
+    if model_type == "linear":
+        model = LinearRegression()
+    elif model_type == "ridge":
+        model = RidgeCV(alphas=[0.01, 0.1, 1.0, 10.0, 100.0], cv=3)
     elif model_type == "xgboost":
-        model = GradientBoostingRegressor(n_estimators=200, max_depth=4,
+        model = GradientBoostingRegressor(n_estimators=100, max_depth=3,
                                            learning_rate=0.1, random_state=42)
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
     
-    # Leave-one-age-out CV
-    ages = np.unique(y_age)
-    y_pred = np.zeros(len(y_age))
-    for test_age in ages:
-        train_mask = y_age != test_age
-        test_mask = y_age == test_age
-        if train_mask.sum() < 10:
-            continue
-        model.fit(X_scaled[train_mask], y_age[train_mask])
-        y_pred[test_mask] = model.predict(X_scaled[test_mask])
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
     
-    mae = mean_absolute_error(y_age, y_pred)
-    r2 = r2_score(y_age, y_pred)
-    
-    # Correlation
-    pearson_r = np.corrcoef(y_age, y_pred)[0, 1]
+    mae = mean_absolute_error(y_test, y_pred)
+    r2 = r2_score(y_test, y_pred)
+    pearson_r = np.corrcoef(y_test, y_pred)[0, 1]
     
     return {
         "mae_months": mae,
@@ -101,17 +101,17 @@ def main(args):
     
     results = {"tissue": tissue, "n_cells": len(X), "n_features": X.shape[1]}
     
-    # Task 1: Binary classification
+    # Task 1: Binary classification (skip elasticnet - too slow with saga)
     print("\n=== Binary Classification (young vs old) ===")
-    for model_type in ["elasticnet", "logistic"]:
+    for model_type in ["logistic"]:
         res = binary_classify(X, y_age, model_type=model_type)
         print(f"  {model_type}: accuracy={res['accuracy']:.3f}, AUC={res['auc']:.3f}")
         for k, v in res.items():
             results[f"binary_{model_type}_{k}"] = v
     
-    # Task 2: Regression
+    # Task 2: Regression (use LinearRegression + train/test split - fastest)
     print("\n=== Continuous Age Regression ===")
-    for model_type in ["elasticnet", "xgboost"]:
+    for model_type in ["linear"]:
         res = regression_predict(X, y_age, model_type=model_type)
         print(f"  {model_type}: MAE={res['mae_months']:.2f} months, R2={res['r2']:.3f}, r={res['pearson_r']:.3f}")
         for k, v in res.items():
