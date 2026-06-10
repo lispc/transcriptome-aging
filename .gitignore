@@ -38,3 +38,7 @@ __pycache__/
 # Kimi
 .kimi-code/
 *.pdf
+
+# Temp files
+.pybiomart.sqlite
+tmp_trainer/

@@ -1,56 +1,65 @@
 """
-Cross-tissue aging validation: train on one tissue, test on another.
+Cross-tissue validation: train classifier on Spleen, test on Lung (and vice versa).
 """
-import argparse
 import numpy as np
 import pandas as pd
 import scanpy as sc
 from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, roc_auc_score
+from sklearn.preprocessing import StandardScaler
 
 
-def cross_tissue_validate(train_path, test_path, model_type="elasticnet"):
-    adata_train = sc.read_h5ad(train_path)
-    adata_test = sc.read_h5ad(test_path)
+def load_data(path):
+    adata = sc.read_h5ad(path)
+    X = adata.obsm["X_uce"]
+    y_age = adata.obs["age"].astype(str).str.replace("m", "").astype(int).values
+    y = (y_age >= 18).astype(int)
+    return X, y, y_age
+
+
+def main():
+    print("Loading Spleen...")
+    X_spleen, y_spleen, _ = load_data("results/uce_spleen/tms_spleen_uce_adata.h5ad")
+    print(f"  Spleen: {len(X_spleen)} cells")
     
-    X_train = adata_train.obsm["X_uce"]
-    y_train = (adata_train.obs["age"].astype(str).str.replace("m", "").astype(int) >= 18).astype(int).values
+    print("Loading Lung...")
+    X_lung, y_lung, _ = load_data("results/uce_lung/tms_lung_uce_adata.h5ad")
+    print(f"  Lung: {len(X_lung)} cells")
     
-    X_test = adata_test.obsm["X_uce"]
-    y_test = (adata_test.obs["age"].astype(str).str.replace("m", "").astype(int) >= 18).astype(int).values
+    scaler_s = StandardScaler().fit(X_spleen)
+    scaler_l = StandardScaler().fit(X_lung)
     
-    scaler = StandardScaler()
-    X_train_s = scaler.fit_transform(X_train)
-    X_test_s = scaler.transform(X_test)
+    # Train on Spleen, test on Lung
+    print("\n=== Train on Spleen, Test on Lung ===")
+    model = LogisticRegression(max_iter=5000, random_state=42)
+    model.fit(scaler_s.transform(X_spleen), y_spleen)
+    proba = model.predict_proba(scaler_l.transform(X_lung))[:, 1]
+    acc = accuracy_score(y_lung, proba >= 0.5)
+    auc = roc_auc_score(y_lung, proba)
+    print(f"  Accuracy: {acc:.3f}, AUC: {auc:.3f}")
     
-    if model_type == "elasticnet":
-        model = LogisticRegression(penalty="elasticnet", solver="saga", l1_ratio=0.5, C=0.1, max_iter=5000)
-    else:
-        model = LogisticRegression(max_iter=5000)
+    # Train on Lung, test on Spleen
+    print("\n=== Train on Lung, Test on Spleen ===")
+    model = LogisticRegression(max_iter=5000, random_state=42)
+    model.fit(scaler_l.transform(X_lung), y_lung)
+    proba = model.predict_proba(scaler_s.transform(X_spleen))[:, 1]
+    acc = accuracy_score(y_spleen, proba >= 0.5)
+    auc = roc_auc_score(y_spleen, proba)
+    print(f"  Accuracy: {acc:.3f}, AUC: {auc:.3f}")
     
-    model.fit(X_train_s, y_train)
-    y_proba = model.predict_proba(X_test_s)[:, 1]
-    y_pred = (y_proba >= 0.5).astype(int)
+    # Same-tissue baselines
+    print("\n=== Same-tissue baselines (for reference) ===")
+    from sklearn.model_selection import cross_val_predict, StratifiedKFold
+    cv = StratifiedKFold(5, shuffle=True, random_state=42)
     
-    return {
-        "train_tissue": adata_train.obs["tissue"].iloc[0],
-        "test_tissue": adata_test.obs["tissue"].iloc[0],
-        "accuracy": accuracy_score(y_test, y_pred),
-        "auc": roc_auc_score(y_test, y_proba),
-        "n_train": len(X_train),
-        "n_test": len(X_test),
-    }
+    proba = cross_val_predict(LogisticRegression(max_iter=5000, random_state=42),
+                               scaler_s.transform(X_spleen), y_spleen, cv=cv, method="predict_proba")[:, 1]
+    print(f"  Spleen CV: AUC={roc_auc_score(y_spleen, proba):.3f}")
+    
+    proba = cross_val_predict(LogisticRegression(max_iter=5000, random_state=42),
+                               scaler_l.transform(X_lung), y_lung, cv=cv, method="predict_proba")[:, 1]
+    print(f"  Lung CV: AUC={roc_auc_score(y_lung, proba):.3f}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--train", required=True)
-    parser.add_argument("--test", required=True)
-    parser.add_argument("--output", default=None)
-    args = parser.parse_args()
-    
-    res = cross_tissue_validate(args.train, args.test)
-    print(res)
-    if args.output:
-        pd.DataFrame([res]).to_csv(args.output, index=False)
+    main()

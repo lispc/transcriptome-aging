@@ -2,10 +2,21 @@
 Compute aging axis with scGPT pretrained model (zero-shot).
 Saves embeddings for later validation of Geneformer ISP results.
 Uses GPU 1 to avoid conflict with ISP on GPU 0.
+
+FIXES applied (2026-06-08):
+- Set LD_LIBRARY_PATH so scGPT imports work (libstdc++ ABI issue).
+- Correctly pass src_key_padding_mask to avoid padding-token contamination.
+- Work around PyTorch 2.0+ nested-tensor bug on GPU by falling back to
+  layer-by-layer forward when the full TransformerEncoder fails.
+- Use scGPT's built-in _encode/_get_cell_emb_from_layer methods for
+  consistency with pretraining.
 """
 
+import os
+# Fix scGPT import: miniforge has a newer libstdc++ than the system one.
+os.environ["LD_LIBRARY_PATH"] = "/home/scroll/miniforge3/lib:" + os.environ.get("LD_LIBRARY_PATH", "")
+
 import json
-import pickle
 import numpy as np
 import torch
 import scanpy as sc
@@ -24,8 +35,10 @@ def load_scgpt_model(checkpoint_path, vocab_path, device):
 
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
-    # Convert FlashMHA Wqkv weights to standard MultiheadAttention in_proj weights
-    # Flash-attn stores QKV as fused Wqkv; PyTorch MHA stores as fused in_proj
+    # Convert FlashMHA Wqkv weights to standard MultiheadAttention in_proj weights.
+    # Flash-attn stores QKV as fused Wqkv [3*embed_dim, embed_dim];
+    # PyTorch MHA stores as fused in_proj [3*embed_dim, embed_dim].
+    # Shapes match exactly, only the parameter name differs.
     converted = {}
     for k, v in checkpoint.items():
         if "self_attn.Wqkv.weight" in k:
@@ -62,11 +75,23 @@ def load_scgpt_model(checkpoint_path, vocab_path, device):
         mvc_decoder_style="inner product",
         ecs_threshold=0.3,
         explicit_zero_prob=False,
-        use_fast_transformer=args.get("fast_transformer", True),
+        use_fast_transformer=False,  # flash-attn not available
         fast_transformer_backend="flash",
         pre_norm=False,
     )
-    model.load_state_dict(checkpoint, strict=False)
+    missing, unexpected = model.load_state_dict(checkpoint, strict=False)
+    print(f"Model loaded. Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
+    if missing:
+        print("  Missing (first 5):", missing[:5])
+    if unexpected:
+        print("  Unexpected (first 5):", unexpected[:5])
+
+    # Verify attention weights actually loaded.
+    ck_wqkv = checkpoint["transformer_encoder.layers.0.self_attn.in_proj_weight"]
+    md_wqkv = dict(model.named_parameters())["transformer_encoder.layers.0.self_attn.in_proj_weight"]
+    assert torch.allclose(ck_wqkv.cpu(), md_wqkv.cpu()), "Attention weight loading mismatch!"
+    print("Attention weight sanity check: PASSED")
+
     model.to(device)
     model.eval()
     return model, vocab, args
@@ -91,7 +116,47 @@ def prepare_cell_for_scgpt(cell_expr, cell_genes, vocab, max_seq_len=1200):
     values = values + [-2] * pad_len
     mask = [1] * (max_seq_len - pad_len) + [0] * pad_len
 
-    return torch.tensor(gene_ids), torch.tensor(values, dtype=torch.float32), torch.tensor(mask)
+    return (
+        torch.tensor(gene_ids, dtype=torch.long),
+        torch.tensor(values, dtype=torch.float32),
+        torch.tensor(mask, dtype=torch.bool),
+    )
+
+
+def safe_encode(model, src, values, mask, device):
+    """
+    Encode a batch through the transformer, handling the PyTorch 2.0+
+    nested-tensor bug on GPU.
+
+    mask: bool tensor, True = real token, False = padding.
+    """
+    src = src.to(device)
+    values = values.to(device)
+    # PyTorch src_key_padding_mask convention: True = padding
+    key_padding_mask = (~mask).to(device)
+
+    gene_embs = model.encoder(src) + model.value_encoder(values)
+
+    try:
+        # Standard path (works on CPU; on GPU it may trigger nested-tensor optimisation)
+        output = model.transformer_encoder(
+            gene_embs, src_key_padding_mask=key_padding_mask
+        )
+    except (RuntimeError, TypeError) as e:
+        err_msg = str(e).lower()
+        if "nested" in err_msg or "to_padded_tensor" in err_msg:
+            # Fallback: layer-by-layer avoids the nested-tensor code path.
+            output = gene_embs
+            for layer in model.transformer_encoder.layers:
+                output = layer(output, src_key_padding_mask=key_padding_mask)
+        else:
+            raise
+
+    # Cell embedding: use scGPT's CLS token (position 0).
+    # mask is already bool, shape (batch, seq_len).
+    # The CLS token is always real (position 0), but we still respect the mask.
+    cell_emb = model._get_cell_emb_from_layer(output, weights=None)
+    return cell_emb
 
 
 def extract_embeddings(model, adata, vocab, device, max_seq_len=1200, batch_size=32):
@@ -119,18 +184,11 @@ def extract_embeddings(model, adata, vocab, device, max_seq_len=1200, batch_size
                 batch_vals.append(vals)
                 batch_mask.append(mask)
 
-            src = torch.stack(batch_src).to(device)
-            vals = torch.stack(batch_vals).to(device)
-            mask = torch.stack(batch_mask).to(device)
+            src = torch.stack(batch_src)
+            vals = torch.stack(batch_vals)
+            mask = torch.stack(batch_mask)
 
-            # Direct encoder + transformer (no src_key_padding_mask to avoid
-            # PyTorch 2.0+ nested tensor bug on GPU)
-            gene_embs = model.encoder(src) + model.value_encoder(vals)
-            output = model.transformer_encoder(gene_embs)  # (batch, seq, embsize)
-
-            # Average pooling with mask (exclude padding)
-            mask_expanded = mask.unsqueeze(-1).float()
-            cell_emb = (output * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1)
+            cell_emb = safe_encode(model, src, vals, mask, device)
             embs.append(cell_emb.cpu().numpy())
 
     return np.vstack(embs)
@@ -178,9 +236,17 @@ def main():
     aging_axis = old_mean - young_mean
     aging_axis = aging_axis / np.linalg.norm(aging_axis)
 
+    print(f"\n=== Results ===")
     print(f"Aging axis norm: {np.linalg.norm(aging_axis):.4f}")
     cos_sim = np.dot(old_mean / np.linalg.norm(old_mean), young_mean / np.linalg.norm(young_mean))
     print(f"Old-young cosine similarity: {cos_sim:.4f}")
+    print(f"Old-young L2 distance: {np.linalg.norm(old_mean - young_mean):.4f}")
+
+    # Per-dimension stats
+    diffs = old_embs.mean(axis=0) - young_embs.mean(axis=0)
+    print(f"Max |diff| across dims: {np.max(np.abs(diffs)):.4f}")
+    print(f"Mean |diff| across dims: {np.mean(np.abs(diffs)):.4f}")
+    print(f"Std of diff: {np.std(diffs):.4f}")
 
     # Save
     out_dir = Path(output_dir)
@@ -188,11 +254,9 @@ def main():
     np.save(out_dir / "scgpt_aging_axis.npy", aging_axis)
     np.save(out_dir / "scgpt_young_mean.npy", young_mean)
     np.save(out_dir / "scgpt_old_mean.npy", old_mean)
-    print(f"Saved to {out_dir}")
-
-    # Also save the embeddings themselves for perturbation
     np.save(out_dir / "scgpt_young_embs.npy", young_embs)
     np.save(out_dir / "scgpt_old_embs.npy", old_embs)
+    print(f"\nSaved to {out_dir}")
     print("Done!")
 
 
