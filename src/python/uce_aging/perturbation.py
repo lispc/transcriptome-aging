@@ -30,11 +30,11 @@ def prepare_perturbed_adata(adata, gene_name, output_path):
 
 def run_uce_inference(adata_path, output_dir, model_loc, nlayers=4, output_dim=1280, batch_size=100):
     """Run UCE inference via subprocess."""
-    script_dir = Path("data/uce-repo").resolve()
+    script_dir = Path(__file__).resolve().parent.parent.parent.parent / "data" / "uce-repo"
     cmd = [
         "python", str(script_dir / "eval_single_anndata.py"),
         "--adata_path", str(Path(adata_path).resolve()),
-        "--dir", str(Path(output_dir).resolve()),
+        "--dir", str(Path(output_dir).resolve()) + os.sep,
         "--species", "mouse",
         "--model_loc", str(Path(model_loc).resolve()),
         "--batch_size", str(batch_size),
@@ -43,7 +43,9 @@ def run_uce_inference(adata_path, output_dir, model_loc, nlayers=4, output_dim=1
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(script_dir))
     if result.returncode != 0:
-        print(f"  UCE error: {result.stderr[:500]}")
+        print(f"  UCE error (rc={result.returncode}):")
+        print(f"  stderr: {result.stderr}")
+        print(f"  stdout: {result.stdout[:500]}")
         return None
     
     # Find output file
@@ -81,6 +83,10 @@ def main(args):
     
     # Load pre-computed aging axis
     aging_axis = np.load(args.aging_axis)
+    
+    # Compute aging scores on original data
+    X = adata.obsm["X_uce"]
+    adata.obs["aging_score"] = X @ aging_axis
     
     # Read gene list
     with open(args.genes, "r") as f:
